@@ -88,45 +88,26 @@ function ReceiptScanModal({ onClose, onConfirmAll }) {
     } catch(e) { setErrMsg("Error al procesar: " + (e && e.message ? e.message : "desconocido")); setStep("error"); }
   };
 
-  const extractPDFText = (file) => new Promise((resolve) => {
-    const reader = new FileReader();
-    reader.onload = (e) => {
-      try {
-        const bin = e.target.result; let out = "";
-        const re = /\(([^)\\]|\\.){1,200}\)/g; let m;
-        while ((m = re.exec(bin)) !== null) {
-          const s = m[0].slice(1,-1).replace(/\\n/g,"\n").replace(/\\r/g,"").replace(/\\t/g," ").replace(/\\\\/g,"\\").replace(/[^\x20-\x7E\n]/g,"");
-          if (s.trim().length > 1) out += s + " ";
-        }
-        resolve(out.trim());
-      } catch { resolve(""); }
-    };
-    reader.onerror = () => resolve("");
-    reader.readAsBinaryString(file);
-  });
-
   const handleFile = async (file) => {
     if (!file) return;
     const isP = file.type === "application/pdf" || (file.name && file.name.toLowerCase().endsWith(".pdf"));
     setPreview(isP ? "pdf" : URL.createObjectURL(file));
-    if (isP) {
-      const text = await extractPDFText(file);
-      if (text.length > 80) { await processText(text); }
-      else { setShowManual(true); setStep("upload"); }
-    } else {
-      setStep("scanning");
-      try {
-        const b64 = await toBase64(file);
-        const mt  = file.type || "image/jpeg";
-        const raw = await callClaude(SCAN_PROMPT, { data: b64, mediaType: mt });
-        const clean = String(raw).replace(/```json|```/g,"").trim();
-        const parsed = JSON.parse(clean);
-        if (!Array.isArray(parsed) || parsed.length === 0) { setErrMsg("No se encontraron productos en la imagen."); setStep("error"); return; }
-        setScanned(parsed.map((p,i) => ({...p, _id:i})));
-        setSelected(parsed.map((_,i) => i));
-        setStep("preview");
-      } catch(e) { setErrMsg("Error: " + (e && e.message ? e.message : "desconocido")); setStep("error"); }
-    }
+    setStep("scanning");
+    try {
+      const b64 = await toBase64(file);
+      const mediaType = isP ? "application/pdf" : (file.type || "image/jpeg");
+      // Send PDF or image directly to API — Claude reads both natively
+      const raw = await callClaude(SCAN_PROMPT, { data: b64, mediaType });
+      const clean = String(raw).replace(/```json|```/g,"").trim();
+      const parsed = JSON.parse(clean);
+      if (!Array.isArray(parsed) || parsed.length === 0) {
+        setErrMsg("No se encontraron productos. Verifica que sea una boleta de supermercado.");
+        setStep("error"); return;
+      }
+      setScanned(parsed.map((p,i) => ({...p, _id:i})));
+      setSelected(parsed.map((_,i) => i));
+      setStep("preview");
+    } catch(e) { setErrMsg("Error: " + (e && e.message ? e.message : "desconocido")); setStep("error"); }
   };
 
   const toggleSelect = (i) => setSelected(prev => prev.includes(i) ? prev.filter(x=>x!==i) : [...prev,i]);
