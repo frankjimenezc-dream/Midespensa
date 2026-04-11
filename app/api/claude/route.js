@@ -15,14 +15,27 @@ export async function POST(request) {
     const content = [];
 
     if (image && image.data && image.mediaType) {
-      content.push({
-        type: "image",
-        source: {
-          type: "base64",
-          media_type: image.mediaType,
-          data: image.data,
-        },
-      });
+      if (image.mediaType === "application/pdf") {
+        // PDFs use the document type — Claude reads them natively
+        content.push({
+          type: "document",
+          source: {
+            type: "base64",
+            media_type: "application/pdf",
+            data: image.data,
+          },
+        });
+      } else {
+        // Images (jpg, png, etc.)
+        content.push({
+          type: "image",
+          source: {
+            type: "base64",
+            media_type: image.mediaType,
+            data: image.data,
+          },
+        });
+      }
     }
 
     content.push({ type: "text", text: prompt });
@@ -37,7 +50,7 @@ export async function POST(request) {
   } catch (error) {
     console.error("Anthropic API error:", error);
     return Response.json(
-      { error: "Error al procesar la solicitud: " + (error.message || "desconocido") },
+      { error: "Error al procesar: " + (error.message || "desconocido") },
       { status: 500 }
     );
   }
