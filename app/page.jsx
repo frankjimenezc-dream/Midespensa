@@ -4,8 +4,8 @@ import { useState, useEffect, useRef } from "react";
 const STORAGE_KEY  = "pantry-products-v3";
 const SHOPPING_KEY = "pantry-shopping-v2";
 const CONSUMED_KEY = "pantry-consumed-v2";
-const CATEGORIES = ["Lácteos","Carnes","Verduras","Frutas","Panadería","Conservas","Bebidas","Congelados","Otros"];
-const CAT_ICONS  = {"Lácteos":"🥛","Carnes":"🥩","Verduras":"🥦","Frutas":"🍎","Panadería":"🍞","Conservas":"🥫","Bebidas":"🧃","Congelados":"🧊","Otros":"📦"};
+const CATEGORIES = ["Lácteos","Carnes","Verduras","Frutas","Panadería","Conservas","Bebidas","Congelados","Limpieza","Higiene","Otros"];
+const CAT_ICONS  = {"Lácteos":"🥛","Carnes":"🥩","Verduras":"🥦","Frutas":"🍎","Panadería":"🍞","Conservas":"🥫","Bebidas":"🧃","Congelados":"🧊","Limpieza":"🧴","Higiene":"🪥","Otros":"📦"};
 const STATUS = {
   ok:      {label:"Vigente",            color:"bg-green-100 text-green-700",   dot:"bg-green-500",  border:"border-green-100"},
   soon:    {label:"Vence pronto",       color:"bg-yellow-100 text-yellow-700", dot:"bg-yellow-400", border:"border-yellow-100"},
@@ -43,6 +43,34 @@ function toBase64(file) {
     r.readAsDataURL(file);
   });
 }
+function defaultExpiry(months = 6) {
+  const d = new Date();
+  d.setMonth(d.getMonth() + months);
+  return d.toISOString().slice(0,10);
+}
+
+// Compress images before sending (fixes mobile large photo issue)
+async function compressImage(file) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    const url = URL.createObjectURL(file);
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      const MAX = 1200;
+      let { width, height } = img;
+      if (width > MAX || height > MAX) {
+        if (width > height) { height = Math.round(height * MAX / width); width = MAX; }
+        else { width = Math.round(width * MAX / height); height = MAX; }
+      }
+      const canvas = document.createElement("canvas");
+      canvas.width = width; canvas.height = height;
+      canvas.getContext("2d").drawImage(img, 0, 0, width, height);
+      canvas.toBlob((blob) => resolve(blob), "image/jpeg", 0.82);
+    };
+    img.onerror = () => resolve(file);
+    img.src = url;
+  });
+}
 
 async function callClaude(prompt, image = null) {
   const body = { prompt };
@@ -60,9 +88,24 @@ async function callClaude(prompt, image = null) {
   return data.content;
 }
 
-const emptyForm = {name:"",category:"Otros",quantity:1,unit:"unidad",expiry:"",purchaseDate:""};
-const SCAN_PROMPT = "Eres un asistente de despensa. Analiza esta boleta/factura de supermercado e identifica TODOS los productos alimenticios. Para cada producto retorna un objeto JSON con: name (string legible en español), category (una de: Lácteos, Carnes, Verduras, Frutas, Panadería, Conservas, Bebidas, Congelados, Otros), quantity (número), unit (unidad/kg/g/L/mL/caja/bolsa/paquete/lata), purchaseDate (YYYY-MM-DD, usa hoy " + new Date().toISOString().slice(0,10) + " si no aparece), expiry (YYYY-MM-DD estimada: lácteos +10d, carnes +4d, frutas/verduras +6d, conservas +365d, pan +4d, bebidas +180d, congelados +90d). Responde SOLO con un JSON array válido sin texto extra ni backticks. Si no hay productos alimenticios retorna [].";
+const emptyForm = {name:"",category:"Otros",quantity:1,unit:"unidad",expiry:"",purchaseDate:"",perishable:true};
 
+const SCAN_PROMPT = `Eres un asistente de despensa. Analiza esta boleta/factura de supermercado e identifica TODOS los productos (alimenticios Y no alimenticios como limpieza, higiene, etc.).
+
+Para cada producto retorna un objeto JSON con:
+- name: string legible en español
+- category: una de: Lácteos, Carnes, Verduras, Frutas, Panadería, Conservas, Bebidas, Congelados, Limpieza, Higiene, Otros
+- quantity: número
+- unit: unidad/kg/g/L/mL/caja/bolsa/paquete/lata
+- perishable: true si es perecible (alimentos frescos, lácteos, carnes, etc.), false si es no perecible (conservas, limpieza, higiene, bebidas envasadas, etc.)
+- purchaseDate: YYYY-MM-DD (usa hoy ${new Date().toISOString().slice(0,10)} si no aparece)
+- expiry: YYYY-MM-DD estimada según tipo:
+  * Perecibles: lácteos +10d, carnes +4d, frutas/verduras +6d, pan +4d, congelados +90d
+  * No perecibles: conservas +365d, bebidas envasadas +180d, limpieza/higiene +730d (2 años), otros NP +180d
+
+Responde SOLO con un JSON array válido sin texto extra ni backticks. Si no hay productos retorna [].`;
+
+/* ══ Receipt Scan Modal ══ */
 function ReceiptScanModal({ onClose, onConfirmAll }) {
   const fileRef = useRef();
   const [step, setStep]             = useState("upload");
@@ -82,7 +125,7 @@ function ReceiptScanModal({ onClose, onConfirmAll }) {
       const clean = String(raw).replace(/```json|```/g,"").trim();
       const parsed = JSON.parse(clean);
       if (!Array.isArray(parsed) || parsed.length === 0) { setErrMsg("No se encontraron productos."); setStep("error"); return; }
-      setScanned(parsed.map((p,i) => ({...p, _id:i})));
+      setScanned(parsed.map((p,i) => ({...p, perishable: p.perishable !== false, _id:i})));
       setSelected(parsed.map((_,i) => i));
       setStep("preview");
     } catch(e) { setErrMsg("Error al procesar: " + (e && e.message ? e.message : "desconocido")); setStep("error"); }
@@ -94,17 +137,14 @@ function ReceiptScanModal({ onClose, onConfirmAll }) {
     setPreview(isP ? "pdf" : URL.createObjectURL(file));
     setStep("scanning");
     try {
-      const b64 = await toBase64(file);
-      const mediaType = isP ? "application/pdf" : (file.type || "image/jpeg");
-      // Send PDF or image directly to API — Claude reads both natively
+      const fileToSend = isP ? file : await compressImage(file);
+      const b64 = await toBase64(fileToSend);
+      const mediaType = isP ? "application/pdf" : "image/jpeg";
       const raw = await callClaude(SCAN_PROMPT, { data: b64, mediaType });
       const clean = String(raw).replace(/```json|```/g,"").trim();
       const parsed = JSON.parse(clean);
-      if (!Array.isArray(parsed) || parsed.length === 0) {
-        setErrMsg("No se encontraron productos. Verifica que sea una boleta de supermercado.");
-        setStep("error"); return;
-      }
-      setScanned(parsed.map((p,i) => ({...p, _id:i})));
+      if (!Array.isArray(parsed) || parsed.length === 0) { setErrMsg("No se encontraron productos. Verifica que sea una boleta de supermercado."); setStep("error"); return; }
+      setScanned(parsed.map((p,i) => ({...p, perishable: p.perishable !== false, _id:i})));
       setSelected(parsed.map((_,i) => i));
       setStep("preview");
     } catch(e) { setErrMsg("Error: " + (e && e.message ? e.message : "desconocido")); setStep("error"); }
@@ -143,11 +183,11 @@ function ReceiptScanModal({ onClose, onConfirmAll }) {
               </button>
               <input ref={fileRef} type="file" accept="image/*,application/pdf" className="hidden" onChange={e => e.target.files[0] && handleFile(e.target.files[0])}/>
               <button onClick={() => setShowManual(v=>!v)} className="w-full text-xs text-emerald-600 hover:underline text-center py-1">
-                {showManual ? "▲ Ocultar entrada manual" : "¿No funciona el PDF? Pega el texto aquí ▼"}
+                {showManual ? "▲ Ocultar entrada manual" : "¿No funciona? Pega el texto aquí ▼"}
               </button>
               {showManual && (
                 <div className="space-y-2">
-                  <textarea value={manualText} onChange={e=>setManualText(e.target.value)} placeholder="Ej: LECHE 1L 4.50&#10;MANZANA 0.5kg 3.20" className="w-full border border-gray-200 rounded-xl px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-emerald-400 resize-none" rows={6}/>
+                  <textarea value={manualText} onChange={e=>setManualText(e.target.value)} placeholder="Ej: LECHE 1L 4.50&#10;DETERGENTE 2.20" className="w-full border border-gray-200 rounded-xl px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-emerald-400 resize-none" rows={6}/>
                   <button onClick={() => manualText.trim() && processText(manualText)} disabled={!manualText.trim()} className="w-full bg-emerald-600 hover:bg-emerald-700 disabled:bg-gray-300 text-white text-sm font-medium py-2.5 rounded-xl transition-colors">Analizar texto</button>
                 </div>
               )}
@@ -168,11 +208,20 @@ function ReceiptScanModal({ onClose, onConfirmAll }) {
                 </button>
                 <span className="text-xs text-gray-400">{selected.length} de {scanned.length} seleccionados</span>
               </div>
+              {/* P/NP summary */}
+              <div className="flex gap-2 text-xs">
+                <span className="bg-emerald-50 text-emerald-700 px-2 py-1 rounded-full font-medium">🟢 P: {scanned.filter(p=>p.perishable!==false).length}</span>
+                <span className="bg-blue-50 text-blue-700 px-2 py-1 rounded-full font-medium">🔵 NP: {scanned.filter(p=>p.perishable===false).length}</span>
+              </div>
               {scanned.map((p,i) => (
                 <div key={p._id} id={"scan-item-"+i} className={"rounded-xl border transition-all " + (selected.includes(p._id) ? "border-emerald-300 bg-emerald-50" : "border-gray-100 bg-white opacity-60")}>
                   {editIdx===i ? (
                     <div className="p-3 space-y-2">
                       <input value={editForm.name} onChange={e=>setEditForm(f=>({...f,name:e.target.value}))} className="w-full border border-gray-200 rounded-lg px-3 py-1.5 text-sm outline-none focus:ring-2 focus:ring-emerald-400"/>
+                      <div className="flex gap-2">
+                        <button onClick={()=>setEditForm(f=>({...f,perishable:true}))} className={"flex-1 text-xs py-1.5 rounded-lg border font-medium "+(editForm.perishable!==false?"bg-emerald-500 text-white border-emerald-500":"bg-white text-gray-500 border-gray-200")}>🟢 Perecible</button>
+                        <button onClick={()=>setEditForm(f=>({...f,perishable:false}))} className={"flex-1 text-xs py-1.5 rounded-lg border font-medium "+(editForm.perishable===false?"bg-blue-500 text-white border-blue-500":"bg-white text-gray-500 border-gray-200")}>🔵 No perecible</button>
+                      </div>
                       <div className="flex gap-2">
                         <button onClick={()=>setEditIdx(null)} className="flex-1 border border-gray-200 text-gray-500 text-xs py-1.5 rounded-lg">Cancelar</button>
                         <button onClick={saveEdit} className="flex-1 bg-emerald-600 text-white text-xs py-1.5 rounded-lg">Guardar</button>
@@ -185,7 +234,10 @@ function ReceiptScanModal({ onClose, onConfirmAll }) {
                       </button>
                       <span className="text-xl">{CAT_ICONS[p.category]||"📦"}</span>
                       <div className="flex-1 min-w-0">
-                        <p className="text-sm font-medium text-gray-800 truncate">{p.name}</p>
+                        <div className="flex items-center gap-1.5">
+                          <p className="text-sm font-medium text-gray-800 truncate">{p.name}</p>
+                          <span className={`text-xs px-1.5 py-0.5 rounded-full font-bold flex-shrink-0 ${p.perishable!==false?"bg-emerald-100 text-emerald-700":"bg-blue-100 text-blue-700"}`}>{p.perishable!==false?"P":"NP"}</span>
+                        </div>
                         <p className="text-xs text-gray-500">{p.quantity} {p.unit} · {p.category}</p>
                       </div>
                       <button onClick={()=>startEdit(i)} className="text-gray-400 hover:text-emerald-600 p-1">✏️</button>
@@ -216,6 +268,13 @@ function ReceiptScanModal({ onClose, onConfirmAll }) {
   );
 }
 
+/* ══ P/NP Badge ══ */
+function PNPBadge({perishable}) {
+  if (perishable === false) return <span className="text-xs px-1.5 py-0.5 rounded-full font-bold bg-blue-100 text-blue-700">NP</span>;
+  return <span className="text-xs px-1.5 py-0.5 rounded-full font-bold bg-emerald-100 text-emerald-700">P</span>;
+}
+
+/* ══ Mini card ══ */
 function MiniCard({p, consumed, onToggleConsumed, onAddShopping}) {
   const isC=consumed.has(p.id), s=isC?{key:"consumed",days:null}:getStatus(p.expiry), st=STATUS[s.key], dsp=daysSince(p.purchaseDate);
   return (
@@ -225,6 +284,7 @@ function MiniCard({p, consumed, onToggleConsumed, onAddShopping}) {
         <div className="flex items-center gap-2 flex-wrap">
           <span>{CAT_ICONS[p.category]}</span>
           <span className="font-medium text-sm text-gray-800">{p.name}</span>
+          <PNPBadge perishable={p.perishable}/>
           <span className={"text-xs px-2 py-0.5 rounded-full font-medium " + st.color}>{st.label}</span>
         </div>
         <div className="flex flex-wrap gap-x-3 mt-1 text-xs text-gray-500">
@@ -244,6 +304,7 @@ function MiniCard({p, consumed, onToggleConsumed, onAddShopping}) {
   );
 }
 
+/* ══ Full product card ══ */
 function ProductCard({p, consumed, onEdit, onDelete, onToggleConsumed, onAddShopping}) {
   const [expanded, setExpanded] = useState(false);
   const isC=consumed.has(p.id), s=isC?{key:"consumed",days:null}:getStatus(p.expiry), st=STATUS[s.key], dsp=daysSince(p.purchaseDate);
@@ -253,7 +314,10 @@ function ProductCard({p, consumed, onEdit, onDelete, onToggleConsumed, onAddShop
         <div className={"w-2.5 h-2.5 rounded-full flex-shrink-0 " + st.dot}/>
         <span className="flex-shrink-0">{CAT_ICONS[p.category]}</span>
         <div className="flex-1 min-w-0">
-          <p className="font-medium text-gray-800 text-sm truncate">{p.name}</p>
+          <div className="flex items-center gap-1.5">
+            <p className="font-medium text-gray-800 text-sm truncate">{p.name}</p>
+            <PNPBadge perishable={p.perishable}/>
+          </div>
           <div className="flex items-center gap-2 mt-0.5">
             <span className="text-xs text-gray-500">{p.quantity} {p.unit}</span>
             <span className={"text-xs font-medium px-2 py-0.5 rounded-full " + st.color}>{!isC ? daysLabel(s.days) : st.label}</span>
@@ -267,6 +331,7 @@ function ProductCard({p, consumed, onEdit, onDelete, onToggleConsumed, onAddShop
         <div className="border-t border-gray-100 px-4 py-3 space-y-2.5 bg-gray-50">
           <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-gray-500">
             <span>🏷️ {p.category}</span>
+            <span>{p.perishable===false ? "🔵 No perecible" : "🟢 Perecible"}</span>
             {dsp!==null && <span>🛍️ Comprado hace {dsp} día{dsp!==1?"s":""}</span>}
             {p.purchaseDate && <span>📅 Compra: {p.purchaseDate}</span>}
             <span>⏳ Vence: {p.expiry}</span>
@@ -291,6 +356,7 @@ function ProductCard({p, consumed, onEdit, onDelete, onToggleConsumed, onAddShop
   );
 }
 
+/* ══ Drill modal ══ */
 function DrillModal({title, subtitle, items, consumed, onToggleConsumed, onAddShopping, onClose, onGoToTab, targetTab, targetFilter}) {
   return (
     <div className="fixed inset-0 bg-black bg-opacity-50 z-40 flex items-end sm:items-center justify-center p-4">
@@ -311,6 +377,7 @@ function DrillModal({title, subtitle, items, consumed, onToggleConsumed, onAddSh
   );
 }
 
+/* ════════════════════════ MAIN ════════════════════════ */
 export default function App() {
   const [products,       setProducts]       = useState([]);
   const [shoppingList,   setShoppingList]   = useState([]);
@@ -321,7 +388,9 @@ export default function App() {
   const [editId,         setEditId]         = useState(null);
   const [tab,            setTab]            = useState("dashboard");
   const [pantryFilter,   setPantryFilter]   = useState("all");
+  const [pnpFilter,      setPnpFilter]      = useState("all"); // "all" | "P" | "NP"
   const [histFilter,     setHistFilter]     = useState("all");
+  const [histPnp,        setHistPnp]        = useState("all");
   const [histCat,        setHistCat]        = useState("all");
   const [catFilter,      setCatFilter]      = useState("all");
   const [search,         setSearch]         = useState("");
@@ -358,19 +427,34 @@ export default function App() {
   const okList  = active.filter(p=>getStatus(p.expiry).key==="ok");
   const alerts  = [...expired,...urgent].filter(p=>!dismissed.has(p.id));
   const shopPending = shoppingList.filter(i=>!i.done).length;
-  const catBreakdown = CATEGORIES.map(c=>({cat:c,total:active.filter(p=>p.category===c).length,expiring:active.filter(p=>p.category===c&&["urgent","expired","soon"].includes(getStatus(p.expiry).key)).length})).filter(c=>c.total>0).sort((a,b)=>b.expiring-a.expiring);
+  const perishableCount = active.filter(p=>p.perishable!==false).length;
+  const nonPerishableCount = active.filter(p=>p.perishable===false).length;
 
-  const handleSubmit   = () => { if(!form.name.trim()||!form.expiry) return; if(editId){setProducts(prev=>prev.map(p=>p.id===editId?{...p,...form}:p));setEditId(null);}else setProducts(prev=>[...prev,{...form,id:Date.now()}]); setForm(emptyForm); setShowForm(false); };
-  const handleEdit     = (p) => { setForm({name:p.name,category:p.category,quantity:p.quantity,unit:p.unit,expiry:p.expiry,purchaseDate:p.purchaseDate||""}); setEditId(p.id); setShowForm(true); };
-  const handleDelete   = (id) => setProducts(prev=>prev.filter(p=>p.id!==id));
-  const toggleConsumed = (id) => setConsumed(prev=>{const s=new Set(prev);s.has(id)?s.delete(id):s.add(id);return s;});
-  const addToShopping  = (name) => { if(shoppingList.some(i=>i.name.toLowerCase()===name.toLowerCase())) return; setShoppingList(prev=>[...prev,{id:Date.now(),name,done:false,fromPantry:true}]); };
-  const addShopItem    = () => { if(!newShopItem.trim()) return; setShoppingList(prev=>[...prev,{id:Date.now(),name:newShopItem.trim(),done:false}]); setNewShopItem(""); };
-  const toggleShopDone = (id) => setShoppingList(prev=>prev.map(i=>i.id===id?{...i,done:!i.done}:i));
-  const deleteShopItem = (id) => setShoppingList(prev=>prev.filter(i=>i.id!==id));
-  const clearDone      = ()   => setShoppingList(prev=>prev.filter(i=>!i.done));
-  const goToTab        = (t,f) => { setTab(t); if(f&&t==="pantry") setPantryFilter(f); if(f&&t==="history") setHistFilter(f); };
-  const handleScanConfirm = (items) => { setProducts(prev=>[...prev,...items]); showToast("✅ "+items.length+" producto"+(items.length!==1?"s":"")+" agregado"+(items.length!==1?"s":"")+" desde la boleta"); };
+  const CATEGORIES_DISPLAY = [...new Set(active.map(p=>p.category))];
+
+  const handleSubmit = () => {
+    if(!form.name.trim()||!form.expiry) return;
+    if(editId){setProducts(prev=>prev.map(p=>p.id===editId?{...p,...form}:p));setEditId(null);}
+    else setProducts(prev=>[...prev,{...form,id:Date.now()}]);
+    setForm(emptyForm); setShowForm(false);
+  };
+  const handleEdit        = (p) => { setForm({name:p.name,category:p.category,quantity:p.quantity,unit:p.unit,expiry:p.expiry,purchaseDate:p.purchaseDate||"",perishable:p.perishable!==false}); setEditId(p.id); setShowForm(true); };
+  const handleDelete      = (id) => setProducts(prev=>prev.filter(p=>p.id!==id));
+  const toggleConsumed    = (id) => setConsumed(prev=>{const s=new Set(prev);s.has(id)?s.delete(id):s.add(id);return s;});
+  const addToShopping     = (name) => { if(shoppingList.some(i=>i.name.toLowerCase()===name.toLowerCase())) return; setShoppingList(prev=>[...prev,{id:Date.now(),name,done:false,fromPantry:true}]); };
+  const addShopItem       = () => { if(!newShopItem.trim()) return; setShoppingList(prev=>[...prev,{id:Date.now(),name:newShopItem.trim(),done:false}]); setNewShopItem(""); };
+  const toggleShopDone    = (id) => setShoppingList(prev=>prev.map(i=>i.id===id?{...i,done:!i.done}:i));
+  const deleteShopItem    = (id) => setShoppingList(prev=>prev.filter(i=>i.id!==id));
+  const clearDone         = ()   => setShoppingList(prev=>prev.filter(i=>!i.done));
+  const goToTab           = (t,f) => { setTab(t); if(f&&t==="pantry") setPantryFilter(f); if(f&&t==="history") setHistFilter(f); };
+  const handleScanConfirm = (items) => { setProducts(prev=>[...prev,...items]); showToast("✅ "+items.length+" producto"+(items.length!==1?"s":"")+" agregado"+(items.length!==1?"s":"")); };
+
+  // Auto-set expiry when switching perishable toggle in form
+  const handlePerishableToggle = (val) => {
+    const newForm = {...form, perishable: val};
+    if (!val && !form.expiry) newForm.expiry = defaultExpiry(6);
+    setForm(newForm);
+  };
 
   const generateRecipes = async () => {
     if(active.length===0) return;
@@ -378,8 +462,8 @@ export default function App() {
     try {
       const expiringNames = [...expired,...urgent,...soon].map(p=>p.name);
       const sorted = [...active].sort((a,b)=>new Date(a.expiry)-new Date(b.expiry));
-      const ingredientList = sorted.map(p=>p.name+" ("+p.quantity+" "+p.unit+(expiringNames.includes(p.name)?" ⚠️POR VENCER":"")+")" ).join(", ");
-      const prompt = "Eres un chef creativo latinoamericano. Con estos ingredientes genera EXACTAMENTE 3 recetas variadas.\n\nINGREDIENTES:\n"+ingredientList+"\n\nResponde SOLO con JSON array de 3 objetos sin texto extra:\n[{\"title\":\"nombre\",\"emoji\":\"emoji\",\"time\":\"20\",\"difficulty\":\"Fácil\",\"usesExpiring\":true,\"ingredientsAvailable\":[\"ing1\"],\"ingredientsMissing\":[\"ing2\"],\"steps\":[\"Paso 1...\",\"Paso 2...\"]}]";
+      const ingredientList = sorted.filter(p=>p.perishable!==false).map(p=>p.name+" ("+p.quantity+" "+p.unit+(expiringNames.includes(p.name)?" ⚠️POR VENCER":"")+")" ).join(", ");
+      const prompt = "Eres un chef creativo latinoamericano. Con estos ingredientes perecibles genera EXACTAMENTE 3 recetas variadas.\n\nINGREDIENTES:\n"+ingredientList+"\n\nResponde SOLO con JSON array de 3 objetos sin texto extra:\n[{\"title\":\"nombre\",\"emoji\":\"emoji\",\"time\":\"20\",\"difficulty\":\"Fácil\",\"usesExpiring\":true,\"ingredientsAvailable\":[\"ing1\"],\"ingredientsMissing\":[\"ing2\"],\"steps\":[\"Paso 1...\",\"Paso 2...\"]}]";
       const raw = await callClaude(prompt);
       const clean = String(raw).replace(/```json|```/g,"").trim();
       const parsed = JSON.parse(clean);
@@ -389,11 +473,30 @@ export default function App() {
     finally { setRecipesLoading(false); }
   };
 
-  const activeCats = [...new Set(active.map(p=>p.category))];
-  const pantryList = active.filter(p=>{const s=getStatus(p.expiry).key;if(pantryFilter==="urgent")return s==="urgent"||s==="expired";if(pantryFilter==="soon")return s==="soon";if(pantryFilter==="ok")return s==="ok";return true;}).filter(p=>catFilter==="all"||p.category===catFilter).filter(p=>p.name.toLowerCase().includes(search.toLowerCase())).sort((a,b)=>new Date(a.expiry)-new Date(b.expiry));
-  const pantryCount = {all:active.length,urgent:urgent.length+expired.length,soon:soon.length,ok:okList.length};
+  // Filtered lists
+  const applyPnp = (list, filter) => {
+    if (filter === "P")  return list.filter(p=>p.perishable!==false);
+    if (filter === "NP") return list.filter(p=>p.perishable===false);
+    return list;
+  };
+
+  const pantryList = applyPnp(
+    active.filter(p=>{const s=getStatus(p.expiry).key;if(pantryFilter==="urgent")return s==="urgent"||s==="expired";if(pantryFilter==="soon")return s==="soon";if(pantryFilter==="ok")return s==="ok";return true;})
+          .filter(p=>catFilter==="all"||p.category===catFilter)
+          .filter(p=>p.name.toLowerCase().includes(search.toLowerCase()))
+          .sort((a,b)=>new Date(a.expiry)-new Date(b.expiry)),
+    pnpFilter
+  );
+  const pantryCount = {all:active.length, urgent:urgent.length+expired.length, soon:soon.length, ok:okList.length};
+
   const allCats = [...new Set(products.map(p=>p.category))];
-  const historyList = products.filter(p=>{const isC=consumed.has(p.id),sk=getStatus(p.expiry).key;if(histFilter==="consumed")return isC;if(histFilter==="expired")return!isC&&sk==="expired";if(histFilter==="urgent")return!isC&&sk==="urgent";if(histFilter==="soon")return!isC&&sk==="soon";if(histFilter==="ok")return!isC&&sk==="ok";return true;}).filter(p=>histCat==="all"||p.category===histCat).filter(p=>p.name.toLowerCase().includes(histSearch.toLowerCase())).sort((a,b)=>new Date(a.expiry)-new Date(b.expiry));
+  const historyList = applyPnp(
+    products.filter(p=>{const isC=consumed.has(p.id),sk=getStatus(p.expiry).key;if(histFilter==="consumed")return isC;if(histFilter==="expired")return!isC&&sk==="expired";if(histFilter==="urgent")return!isC&&sk==="urgent";if(histFilter==="soon")return!isC&&sk==="soon";if(histFilter==="ok")return!isC&&sk==="ok";return true;})
+            .filter(p=>histCat==="all"||p.category===histCat)
+            .filter(p=>p.name.toLowerCase().includes(histSearch.toLowerCase()))
+            .sort((a,b)=>new Date(a.expiry)-new Date(b.expiry)),
+    histPnp
+  );
   const histCounts = {all:products.length,ok:okList.length,soon:soon.length,urgent:urgent.length,expired:expired.length,consumed:consumed.size};
 
   return (
@@ -407,10 +510,25 @@ export default function App() {
           </div>
         </div>
       </div>
+
       <div className="max-w-2xl mx-auto px-4 py-4 space-y-4">
+        {/* ══ DASHBOARD ══ */}
         {tab==="dashboard" && (
           <div className="space-y-4">
             <p className="text-xs text-gray-400 uppercase tracking-widest font-semibold">Resumen ejecutivo</p>
+
+            {/* P / NP summary row */}
+            <div className="grid grid-cols-2 gap-3">
+              <button onClick={()=>{setTab("pantry");setPnpFilter("P");}} className="bg-white rounded-2xl border border-emerald-100 shadow-sm p-4 flex items-center gap-3 hover:shadow-md transition-all text-left">
+                <div className="w-12 h-12 rounded-xl bg-emerald-50 flex items-center justify-center text-2xl flex-shrink-0">🟢</div>
+                <div><p className="text-2xl font-bold text-gray-800">{perishableCount}</p><p className="text-xs text-gray-500 font-medium">Perecibles</p></div>
+              </button>
+              <button onClick={()=>{setTab("pantry");setPnpFilter("NP");}} className="bg-white rounded-2xl border border-blue-100 shadow-sm p-4 flex items-center gap-3 hover:shadow-md transition-all text-left">
+                <div className="w-12 h-12 rounded-xl bg-blue-50 flex items-center justify-center text-2xl flex-shrink-0">🔵</div>
+                <div><p className="text-2xl font-bold text-gray-800">{nonPerishableCount}</p><p className="text-xs text-gray-500 font-medium">No perecibles</p></div>
+              </button>
+            </div>
+
             <div className="grid grid-cols-1 gap-3">
               <button onClick={()=>setDrillModal({title:"Total en despensa",subtitle:active.length+" productos activos",items:active.sort((a,b)=>new Date(a.expiry)-new Date(b.expiry)),targetTab:"pantry",targetFilter:"all"})} className="bg-white rounded-2xl border border-gray-100 shadow-sm p-5 flex items-center gap-5 hover:shadow-md hover:border-emerald-200 transition-all text-left w-full">
                 <div className="w-16 h-16 rounded-2xl bg-blue-50 flex items-center justify-center text-3xl flex-shrink-0">🥫</div>
@@ -429,39 +547,36 @@ export default function App() {
                 <span className="text-gray-300 text-xl">›</span>
               </button>
             </div>
-            {catBreakdown.length>0&&(
-              <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-5">
-                <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-3">Por categoría</p>
-                <div className="space-y-2.5">
-                  {catBreakdown.map(c=>{const pct=c.total>0?Math.round((c.expiring/c.total)*100):0;return(
-                    <button key={c.cat} onClick={()=>{goToTab("pantry","all");setCatFilter(c.cat);}} className="w-full flex items-center gap-3 hover:bg-gray-50 rounded-lg px-1 py-1 transition-colors">
-                      <span className="text-xl w-7 text-center flex-shrink-0">{CAT_ICONS[c.cat]}</span>
-                      <div className="flex-1 min-w-0"><div className="flex justify-between items-center mb-1"><span className="text-sm text-gray-700 font-medium">{c.cat}</span><span className="text-xs text-gray-400">{c.total} prod.</span></div><div className="h-1.5 bg-gray-100 rounded-full overflow-hidden"><div className={"h-full rounded-full "+(pct>0?"bg-yellow-400":"bg-green-400")} style={{width:Math.max(pct,4)+"%"}}/></div></div>
-                      {c.expiring>0&&<span className="text-xs text-orange-500 font-semibold flex-shrink-0">{c.expiring} ⚠️</span>}
-                      <span className="text-gray-300 text-sm flex-shrink-0">›</span>
-                    </button>
-                  );})}
-                </div>
-              </div>
-            )}
             {products.length===0&&<div className="text-center py-12 text-gray-400"><div className="text-6xl mb-3">🥫</div><p className="text-sm font-medium">Tu despensa está vacía</p><p className="text-xs mt-1">Ve a <strong>Compras</strong> para agregar productos</p></div>}
           </div>
         )}
+
+        {/* ══ PANTRY ══ */}
         {tab==="pantry" && (
           <>
             {alerts.length>0&&(<div className="bg-red-50 border border-red-200 rounded-xl p-4"><div className="flex items-center justify-between mb-2"><p className="text-sm font-semibold text-red-700">⚠️ {alerts.length} producto{alerts.length!==1?"s":""} requieren atención</p><button onClick={()=>setDismissed(new Set(alerts.map(a=>a.id)))} className="text-xs text-red-400 hover:underline">Descartar</button></div><ul className="space-y-1.5">{alerts.map(p=>{const s=getStatus(p.expiry);return(<li key={p.id} className="flex items-center justify-between text-sm text-red-700"><span>• <strong>{p.name}</strong> — {daysLabel(s.days)}</span><button onClick={()=>addToShopping(p.name)} className="text-xs bg-red-100 text-red-600 px-2 py-0.5 rounded-full ml-2">+ Compras</button></li>);})}</ul></div>)}
             <input type="text" placeholder="🔍 Buscar producto..." value={search} onChange={e=>setSearch(e.target.value)} className="w-full border border-gray-200 rounded-lg px-4 py-2 text-sm outline-none focus:ring-2 focus:ring-emerald-400 bg-white"/>
+            {/* Estado filter */}
             <div className="flex gap-2 overflow-x-auto pb-1">{[{key:"all",label:"Todos"},{key:"urgent",label:"🔴 Urgente"},{key:"soon",label:"🟡 Pronto"},{key:"ok",label:"🟢 Vigentes"}].map(t=>(<button key={t.key} onClick={()=>setPantryFilter(t.key)} className={"whitespace-nowrap text-xs font-medium px-3 py-1.5 rounded-full border transition-colors "+(pantryFilter===t.key?"bg-emerald-600 text-white border-emerald-600":"bg-white text-gray-600 border-gray-200")}>{t.label} ({pantryCount[t.key]})</button>))}</div>
-            {activeCats.length>1&&<div className="flex gap-2 overflow-x-auto pb-1"><button onClick={()=>setCatFilter("all")} className={"whitespace-nowrap text-xs px-3 py-1 rounded-full border "+(catFilter==="all"?"bg-gray-700 text-white border-gray-700":"bg-white text-gray-500 border-gray-200")}>Todas</button>{activeCats.map(c=>(<button key={c} onClick={()=>setCatFilter(c)} className={"whitespace-nowrap text-xs px-3 py-1 rounded-full border "+(catFilter===c?"bg-gray-700 text-white border-gray-700":"bg-white text-gray-500 border-gray-200")}>{CAT_ICONS[c]} {c}</button>))}</div>}
+            {/* P/NP filter */}
+            <div className="flex gap-2">
+              {[{key:"all",label:"Todos",cls:"bg-gray-700"},{key:"P",label:"🟢 Perecibles",cls:"bg-emerald-600"},{key:"NP",label:"🔵 No perecibles",cls:"bg-blue-600"}].map(t=>(
+                <button key={t.key} onClick={()=>setPnpFilter(t.key)} className={"whitespace-nowrap text-xs font-medium px-3 py-1.5 rounded-full border transition-colors "+(pnpFilter===t.key?t.cls+" text-white border-transparent":"bg-white text-gray-600 border-gray-200")}>{t.label}</button>
+              ))}
+            </div>
+            {/* Category filter */}
+            {CATEGORIES_DISPLAY.length>1&&<div className="flex gap-2 overflow-x-auto pb-1"><button onClick={()=>setCatFilter("all")} className={"whitespace-nowrap text-xs px-3 py-1 rounded-full border "+(catFilter==="all"?"bg-gray-700 text-white border-gray-700":"bg-white text-gray-500 border-gray-200")}>Todas</button>{CATEGORIES_DISPLAY.map(c=>(<button key={c} onClick={()=>setCatFilter(c)} className={"whitespace-nowrap text-xs px-3 py-1 rounded-full border "+(catFilter===c?"bg-gray-700 text-white border-gray-700":"bg-white text-gray-500 border-gray-200")}>{CAT_ICONS[c]} {c}</button>))}</div>}
             {pantryList.length===0?<div className="text-center py-16 text-gray-400"><div className="text-5xl mb-3">🥫</div><p className="text-sm">No hay productos aquí</p></div>:<div className="space-y-2">{pantryList.map(p=><ProductCard key={p.id} p={p} consumed={consumed} onEdit={handleEdit} onDelete={handleDelete} onToggleConsumed={toggleConsumed} onAddShopping={addToShopping}/>)}</div>}
           </>
         )}
+
+        {/* ══ RECIPES ══ */}
         {tab==="recipes" && (
           <div className="space-y-4">
             <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-5">
               <p className="text-sm font-semibold text-gray-700 mb-1">👨‍🍳 ¿Qué puedo cocinar hoy?</p>
-              <p className="text-xs text-gray-400 mb-4">La IA sugerirá 3 recetas priorizando los ingredientes por vencer.</p>
-              <button onClick={generateRecipes} disabled={recipesLoading||active.length===0} className="w-full bg-emerald-600 hover:bg-emerald-700 disabled:bg-gray-300 text-white text-sm font-semibold py-3 rounded-xl flex items-center justify-center gap-2">
+              <p className="text-xs text-gray-400 mb-4">La IA sugerirá 3 recetas usando tus ingredientes perecibles.</p>
+              <button onClick={generateRecipes} disabled={recipesLoading||active.filter(p=>p.perishable!==false).length===0} className="w-full bg-emerald-600 hover:bg-emerald-700 disabled:bg-gray-300 text-white text-sm font-semibold py-3 rounded-xl flex items-center justify-center gap-2">
                 {recipesLoading ? <><div className="flex gap-1">{[0,1,2].map(i=><div key={i} className="w-2 h-2 bg-white rounded-full animate-bounce" style={{animationDelay:i*0.15+"s"}}/>)}</div>Generando...</> : <><span>✨</span>Generar recetas con mi despensa</>}
               </button>
             </div>
@@ -492,15 +607,25 @@ export default function App() {
             ))}
           </div>
         )}
+
+        {/* ══ HISTORY ══ */}
         {tab==="history" && (
           <>
             <input type="text" placeholder="🔍 Buscar en historial..." value={histSearch} onChange={e=>setHistSearch(e.target.value)} className="w-full border border-gray-200 rounded-lg px-4 py-2 text-sm outline-none focus:ring-2 focus:ring-emerald-400 bg-white"/>
             <div className="flex gap-2 overflow-x-auto pb-1">{[{key:"all",label:"Todos"},{key:"ok",label:"🟢 Vigentes"},{key:"soon",label:"🟡 Pronto"},{key:"urgent",label:"🟠 Urgente"},{key:"expired",label:"🔴 Vencidos"},{key:"consumed",label:"✅ Consumidos"}].map(t=>(<button key={t.key} onClick={()=>setHistFilter(t.key)} className={"whitespace-nowrap text-xs font-medium px-3 py-1.5 rounded-full border "+(histFilter===t.key?"bg-gray-700 text-white border-gray-700":"bg-white text-gray-600 border-gray-200")}>{t.label} ({histCounts[t.key]})</button>))}</div>
+            {/* P/NP filter in history */}
+            <div className="flex gap-2">
+              {[{key:"all",label:"Todos",cls:"bg-gray-700"},{key:"P",label:"🟢 Perecibles",cls:"bg-emerald-600"},{key:"NP",label:"🔵 No perecibles",cls:"bg-blue-600"}].map(t=>(
+                <button key={t.key} onClick={()=>setHistPnp(t.key)} className={"whitespace-nowrap text-xs font-medium px-3 py-1.5 rounded-full border transition-colors "+(histPnp===t.key?t.cls+" text-white border-transparent":"bg-white text-gray-600 border-gray-200")}>{t.label}</button>
+              ))}
+            </div>
             {allCats.length>1&&<div className="flex gap-2 overflow-x-auto pb-1"><button onClick={()=>setHistCat("all")} className={"whitespace-nowrap text-xs px-3 py-1 rounded-full border "+(histCat==="all"?"bg-gray-700 text-white border-gray-700":"bg-white text-gray-500 border-gray-200")}>Todas</button>{allCats.map(c=>(<button key={c} onClick={()=>setHistCat(c)} className={"whitespace-nowrap text-xs px-3 py-1 rounded-full border "+(histCat===c?"bg-gray-700 text-white border-gray-700":"bg-white text-gray-500 border-gray-200")}>{CAT_ICONS[c]} {c}</button>))}</div>}
             <div className="grid grid-cols-3 gap-2">{[{label:"Total",val:histCounts.all,bg:"bg-gray-100",text:"text-gray-700"},{label:"Vigentes",val:histCounts.ok,bg:"bg-green-50",text:"text-green-700"},{label:"Vencidos",val:histCounts.expired,bg:"bg-red-50",text:"text-red-700"},{label:"Urgente",val:histCounts.urgent,bg:"bg-orange-50",text:"text-orange-700"},{label:"Pronto",val:histCounts.soon,bg:"bg-yellow-50",text:"text-yellow-700"},{label:"Consumidos",val:histCounts.consumed,bg:"bg-emerald-50",text:"text-emerald-700"}].map(s=>(<div key={s.label} className={s.bg+" rounded-lg p-2 text-center"}><p className={"text-lg font-bold "+s.text}>{s.val}</p><p className="text-xs text-gray-500">{s.label}</p></div>))}</div>
             {historyList.length===0?<div className="text-center py-16 text-gray-400"><div className="text-5xl mb-3">📋</div><p className="text-sm">No hay productos en esta vista</p></div>:<div className="space-y-2">{historyList.map(p=><ProductCard key={p.id} p={p} consumed={consumed} onEdit={handleEdit} onDelete={handleDelete} onToggleConsumed={toggleConsumed} onAddShopping={addToShopping}/>)}</div>}
           </>
         )}
+
+        {/* ══ SHOPPING ══ */}
         {tab==="shopping" && (
           <>
             <div className="grid grid-cols-2 gap-3">
@@ -524,6 +649,8 @@ export default function App() {
           </>
         )}
       </div>
+
+      {/* Bottom Nav */}
       <div className="fixed bottom-0 left-0 right-0 bg-white border-t border-gray-100 shadow-lg z-20">
         <div className="max-w-2xl mx-auto flex">
           {[{key:"dashboard",icon:"📊",label:"Resumen",badge:0},{key:"pantry",icon:"🥫",label:"Despensa",badge:expired.length+urgent.length},{key:"recipes",icon:"👨‍🍳",label:"Recetas",badge:0},{key:"history",icon:"📋",label:"Historial",badge:0},{key:"shopping",icon:"🛒",label:"Compras",badge:shopPending}].map(t=>(
@@ -534,13 +661,23 @@ export default function App() {
           ))}
         </div>
       </div>
+
       {showScan&&<ReceiptScanModal onClose={()=>setShowScan(false)} onConfirmAll={handleScanConfirm}/>}
       {drillModal&&<DrillModal {...drillModal} consumed={consumed} onToggleConsumed={toggleConsumed} onAddShopping={addToShopping} onClose={()=>setDrillModal(null)} onGoToTab={goToTab}/>}
+
       {showForm&&(
         <div className="fixed inset-0 bg-black bg-opacity-40 z-30 flex items-end sm:items-center justify-center p-4">
           <div className="bg-white rounded-2xl w-full max-w-md p-6 space-y-4 shadow-xl">
             <h2 className="text-lg font-bold text-gray-800">{editId?"Editar producto":"Agregar producto"}</h2>
             <div className="space-y-3">
+              {/* P / NP toggle */}
+              <div>
+                <label className="text-xs font-medium text-gray-600 mb-1 block">Tipo</label>
+                <div className="flex gap-2">
+                  <button onClick={()=>handlePerishableToggle(true)} className={"flex-1 py-2 rounded-lg border text-sm font-medium transition-colors "+(form.perishable!==false?"bg-emerald-500 text-white border-emerald-500":"bg-white text-gray-500 border-gray-200")}>🟢 Perecible</button>
+                  <button onClick={()=>handlePerishableToggle(false)} className={"flex-1 py-2 rounded-lg border text-sm font-medium transition-colors "+(form.perishable===false?"bg-blue-500 text-white border-blue-500":"bg-white text-gray-500 border-gray-200")}>🔵 No perecible</button>
+                </div>
+              </div>
               <div><label className="text-xs font-medium text-gray-600 mb-1 block">Nombre *</label><input type="text" value={form.name} onChange={e=>setForm(f=>({...f,name:e.target.value}))} placeholder="Ej: Leche descremada" className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-emerald-400"/></div>
               <div className="grid grid-cols-2 gap-3">
                 <div><label className="text-xs font-medium text-gray-600 mb-1 block">Cantidad</label><input type="number" min="1" value={form.quantity} onChange={e=>setForm(f=>({...f,quantity:e.target.value}))} className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-emerald-400"/></div>
@@ -549,7 +686,12 @@ export default function App() {
               <div><label className="text-xs font-medium text-gray-600 mb-1 block">Categoría</label><select value={form.category} onChange={e=>setForm(f=>({...f,category:e.target.value}))} className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-emerald-400">{CATEGORIES.map(c=><option key={c}>{c}</option>)}</select></div>
               <div className="grid grid-cols-2 gap-3">
                 <div><label className="text-xs font-medium text-gray-600 mb-1 block">Fecha de compra</label><input type="date" value={form.purchaseDate} onChange={e=>setForm(f=>({...f,purchaseDate:e.target.value}))} className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-emerald-400"/></div>
-                <div><label className="text-xs font-medium text-gray-600 mb-1 block">Vencimiento *</label><input type="date" value={form.expiry} onChange={e=>setForm(f=>({...f,expiry:e.target.value}))} className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-emerald-400"/></div>
+                <div>
+                  <label className="text-xs font-medium text-gray-600 mb-1 block">
+                    Vencimiento {form.perishable===false && <span className="text-blue-400">(NP: 6 meses default)</span>}
+                  </label>
+                  <input type="date" value={form.expiry} onChange={e=>setForm(f=>({...f,expiry:e.target.value}))} className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-emerald-400"/>
+                </div>
               </div>
             </div>
             <div className="flex gap-3 pt-1">
